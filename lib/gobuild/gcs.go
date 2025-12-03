@@ -169,12 +169,14 @@ func (s *GCSCache) Put(ctx context.Context, obj gocache.Object) (diskPath string
 		data := fmt.Sprintf("%s %d", outputID, obj.ModTime.Unix())
 		if _, err := s.GCSClient.PutCond(sctx, s.actionKey(actionID), "", strings.NewReader(data)); err != nil {
 			s.putGCSError.Add(1)
+			gocache.Logf(sctx, "[gcs] write action %s: %v", actionID, err)
 			return fmt.Errorf("[gcs] write action %s: %w", actionID, err)
 		}
 		s.putGCSAction.Add(1)
 
 		if ok, err := s.GCSClient.PutCond(sctx, s.outputKey(outputID), hash, f); err != nil {
 			s.putGCSError.Add(1)
+			gocache.Logf(sctx, "[gcs] write object %s: %v", outputID, err)
 			return fmt.Errorf("[gcs] write object %s: %w", outputID, err)
 		} else if !ok {
 			s.putGCSFound.Add(1)

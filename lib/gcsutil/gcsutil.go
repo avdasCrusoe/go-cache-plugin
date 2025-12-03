@@ -5,6 +5,7 @@ package gcsutil
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -66,7 +67,7 @@ func (c *Client) Get(ctx context.Context, key string) (io.ReadCloser, int64, err
 	attrs, err := obj.Attrs(ctx)
 	if err != nil {
 		// If the object does not exist, return fs.ErrNotExist.
-		if err == storage.ErrObjectNotExist {
+		if errors.Is(err, storage.ErrObjectNotExist) {
 			return nil, -1, fmt.Errorf("key %q: %w", key, fs.ErrNotExist)
 		}
 		// Otherwise, return the error.
@@ -106,8 +107,8 @@ func (c *Client) PutCond(ctx context.Context, key, md5hash string, data io.Reade
 		if existingMD5 == md5hash {
 			return false, nil
 		}
-	} else if err != storage.ErrObjectNotExist {
-		// Object exists but MD5 does not match, return error.
+	} else if err != nil && !errors.Is(err, storage.ErrObjectNotExist) {
+		// Some error other than "object does not exist" occurred.
 		return false, err
 	}
 
