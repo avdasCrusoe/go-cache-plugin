@@ -42,10 +42,14 @@ func NewClient(ctx context.Context, bucket string, opts ...option.ClientOption) 
 // Put writes the specified data to GCS under the given key.
 func (c *Client) Put(ctx context.Context, key string, data io.Reader) error {
 	wc := c.Client.Bucket(c.Bucket).Object(key).NewWriter(ctx)
+
+	// Copy the data to the writer.
 	if _, err := io.Copy(wc, data); err != nil {
 		wc.Close()
 		return fmt.Errorf("write to GCS: %w", err)
 	}
+
+	// Close the writer.
 	if err := wc.Close(); err != nil {
 		return fmt.Errorf("close GCS writer: %w", err)
 	}
