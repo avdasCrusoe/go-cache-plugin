@@ -11,6 +11,7 @@ import (
 	"errors"
 	"expvar"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path"
@@ -18,6 +19,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/creachadair/command"
 	"github.com/creachadair/gocache"
 	"github.com/creachadair/gocache/cachedir"
@@ -25,69 +29,170 @@ import (
 	"github.com/creachadair/taskgroup"
 	"github.com/creachadair/tlsutil"
 	"github.com/goproxy/goproxy"
-	"github.com/tailscale/go-cache-plugin/lib/gobuild"
 	"github.com/tailscale/go-cache-plugin/lib/gcsutil"
+	"github.com/tailscale/go-cache-plugin/lib/gobuild"
 	"github.com/tailscale/go-cache-plugin/lib/modproxy"
 	"github.com/tailscale/go-cache-plugin/lib/revproxy"
+	"github.com/tailscale/go-cache-plugin/lib/s3util"
 	"google.golang.org/api/option"
 	"tailscale.com/tsweb"
 )
 
-func initCacheServer(env *command.Env) (*gocache.Server, *gcsutil.Client, error) {
+func initCacheServer(env *command.Env) (*gocache.Server, revproxy.CacheClient, error) {
 	// Validate required fields
 	if flags.CacheDir == "" {
 		return nil, nil, env.Usagef("you must provide a --cache-dir")
 	}
-	if flags.GCSBucket == "" {
-		return nil, nil, env.Usagef("you must provide a --gcs-bucket name")
-	}
-	
+
 	// Create the local cache directory
 	dir, err := cachedir.New(flags.CacheDir)
 	if err != nil {
 		return nil, nil, fmt.Errorf("create local cache: %w", err)
 	}
-	
+
 	vprintf("local cache directory: %s", flags.CacheDir)
-	vprintf("GCS cache bucket: %s", flags.GCSBucket)
-	
-	// Initialize GCS client
-	gcsClient, err := initGCSClient(env.Context(), flags.GCSBucket, flags.GCSKeyFile)
-	if err != nil {
-		return nil, nil, fmt.Errorf("initialize GCS client: %w", err)
-	}
-	
-	// Create GCS cache
-	gcsCache := &gobuild.GCSCache{
-		Local:             dir,
-		GCSClient:         gcsClient,
-		KeyPrefix:         flags.KeyPrefix,
-		MinUploadSize:     flags.MinUploadSize,
-		UploadConcurrency: flags.GCSConcurrency,
-	}
-	gcsCache.SetMetrics(env.Context(), expvar.NewMap("gocache_host"))
-	
-	// Set up the close function
-	close := gcsCache.Close
-	if flags.Expiration > 0 {
-		dirClose := dir.Cleanup(flags.Expiration)
-		close = func(ctx context.Context) error {
-			return errors.Join(gcsCache.Close(ctx), dirClose(ctx))
+
+	// Determine which storage backend to use
+	storage := flags.StorageBackend
+	if storage == "" {
+		// For backward compatibility: if no specific backend is set but a bucket is provided
+		// Check for multiple bucket flags
+		hasMultipleBuckets := false
+		bucketCount := 0
+		if flags.Bucket != "" { bucketCount++ }
+		if flags.GCSBucket != "" { bucketCount++ }
+		if flags.S3Bucket != "" { bucketCount++ }
+		if bucketCount > 1 {
+			hasMultipleBuckets = true
+		}
+		
+		if hasMultipleBuckets {
+			return nil, nil, env.Usagef("you must provide only one bucket flag (--bucket, --gcs-bucket, or --s3-bucket)")
+		}
+		
+		if flags.Bucket != "" {
+			storage = "s3" // Default to S3 for backward compatibility
+		} else if flags.GCSBucket != "" {
+			storage = "gcs"
+		} else if flags.S3Bucket != "" {
+			storage = "s3"
+		} else {
+			return nil, nil, env.Usagef("you must provide a storage backend (--storage=s3|gcs) and appropriate bucket")
 		}
 	}
-	
-	// Create the server
+
+	// Storage client for the revproxy
+	var storageClient revproxy.CacheClient
+
+	// Set up the appropriate storage client and cache implementation
+	var close func(context.Context) error
+	var get func(context.Context, string) (string, string, error)
+	var put func(context.Context, gocache.Object) (string, error)
+	var setMetrics func(context.Context, *expvar.Map)
+
+	// Initialize the storage client and cache implementation
+	switch storage {
+	case "gcs":
+		// Validate GCS-specific parameters
+		bucket := flags.GCSBucket
+		if bucket == "" && flags.Bucket != "" {
+			// For backward compatibility
+			bucket = flags.Bucket
+		}
+		if bucket == "" {
+			return nil, nil, env.Usagef("you must provide a --gcs-bucket name")
+		}
+
+		vprintf("GCS cache bucket: %s", bucket)
+
+		// Initialize GCS client
+		gcsClient, err := initGCSClient(env.Context(), bucket, flags.GCSKeyFile)
+		if err != nil {
+			return nil, nil, fmt.Errorf("initialize GCS client: %w", err)
+		}
+
+		// Create storage adapter for revproxy
+		storageClient = revproxy.NewGCSAdapter(gcsClient)
+
+		// Create GCS cache for gocache
+		gcsCache := &gobuild.GCSCache{
+			Local:             dir,
+			GCSClient:         gcsClient,
+			KeyPrefix:         flags.KeyPrefix,
+			MinUploadSize:     flags.MinUploadSize,
+			UploadConcurrency: flags.GCSConcurrency,
+		}
+		gcsCache.SetMetrics(env.Context(), expvar.NewMap("gocache_host"))
+
+		// Set up the functions
+		get = gcsCache.Get
+		put = gcsCache.Put
+		close = gcsCache.Close
+		setMetrics = gcsCache.SetMetrics
+
+	case "s3":
+		// Validate S3-specific parameters
+		bucket := flags.S3Bucket
+		if bucket == "" && flags.Bucket != "" {
+			// For backward compatibility
+			bucket = flags.Bucket
+		}
+		if bucket == "" {
+			return nil, nil, env.Usagef("you must provide a --s3-bucket name")
+		}
+
+		vprintf("S3 cache bucket: %s", bucket)
+
+		// Initialize AWS S3 client
+		s3Client, err := initS3Client(env.Context(), bucket, flags.S3Region, flags.S3Endpoint, flags.S3PathStyle)
+		if err != nil {
+			return nil, nil, fmt.Errorf("initialize S3 client: %w", err)
+		}
+
+		// Create storage adapter for revproxy
+		storageClient = revproxy.NewS3Adapter(s3Client)
+
+		// Create S3 cache for gocache
+		s3Cache := &gobuild.S3Cache{
+			Local:             dir,
+			Client:           s3Client,
+			KeyPrefix:         flags.KeyPrefix,
+			MinUploadSize:     flags.MinUploadSize,
+			UploadConcurrency: flags.S3Concurrency,
+		}
+		s3Cache.SetMetrics(env.Context(), expvar.NewMap("gocache_host"))
+
+		// Set up the functions
+		get = s3Cache.Get
+		put = s3Cache.Put
+		close = s3Cache.Close
+		setMetrics = s3Cache.SetMetrics
+
+	default:
+		return nil, nil, env.Usagef("invalid storage backend: %q (must be 's3' or 'gcs')", storage)
+	}
+
+	// Add directory cleanup if requested
+	if flags.Expiration > 0 {
+		dirClose := dir.Cleanup(flags.Expiration)
+		originalClose := close
+		close = func(ctx context.Context) error {
+			return errors.Join(originalClose(ctx), dirClose(ctx))
+		}
+	}
+
+	// Create the server with the appropriate callback functions
 	s := &gocache.Server{
-		Get:         gcsCache.Get,
-		Put:         gcsCache.Put,
+		Get:         get,
+		Put:         put,
 		Close:       close,
-		SetMetrics:  gcsCache.SetMetrics,
+		SetMetrics:  setMetrics,
 		MaxRequests: flags.Concurrency,
 		Logf:        vprintf,
 		LogRequests: flags.DebugLog&debugBuildCache != 0,
 	}
 	expvar.Publish("gocache_server", s.Metrics().Get("server"))
-	return s, gcsClient, nil
+	return s, storageClient, nil
 }
 
 // initGCSClient initializes a Google Cloud Storage client
@@ -98,15 +203,78 @@ func initGCSClient(ctx context.Context, bucket, keyFile string) (*gcsutil.Client
 		// If a key file is specified, use it for authentication
 		opts = append(opts, option.WithCredentialsFile(keyFile))
 	}
-	
+
 	// Create the GCS client
 	return gcsutil.NewClient(ctx, bucket, opts...)
+}
+
+// initS3Client initializes an Amazon S3 client
+func initS3Client(ctx context.Context, bucket, region, endpoint string, pathStyle bool) (*s3util.Client, error) {
+	// If region is not specified, try to resolve it from the bucket
+	if region == "" {
+		var err error
+		region, err = s3util.BucketRegion(ctx, bucket)
+		if err != nil {
+			return nil, fmt.Errorf("resolve region for bucket %q: %w", bucket, err)
+		}
+	}
+	vprintf("S3 region: %s", region)
+
+	// Load the AWS configuration
+	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))
+	if err != nil {
+		return nil, fmt.Errorf("load AWS config: %w", err)
+	}
+
+	// Create the S3 client with appropriate options
+	opts := []func(*s3.Options){}
+	if endpoint != "" {
+		vprintf("S3 endpoint URL: %s", endpoint)
+		opts = append(opts, func(o *s3.Options) {
+			o.BaseEndpoint = aws.String(endpoint)
+		})
+	}
+	if pathStyle {
+		vprintf("S3 path-style URLs enabled")
+		opts = append(opts, func(o *s3.Options) {
+			o.UsePathStyle = true
+		})
+	}
+
+	// Create the S3 client wrapper
+	return &s3util.Client{
+		Client: s3.NewFromConfig(cfg, opts...),
+		Bucket: bucket,
+	}, nil
+}
+
+type revproxyModproxyAdapter struct {
+	client revproxy.CacheClient
+}
+
+func (a *revproxyModproxyAdapter) Get(ctx context.Context, key string) (io.ReadCloser, int64, error) {
+	return a.client.Get(ctx, key)
+}
+
+func (a *revproxyModproxyAdapter) GetData(ctx context.Context, key string) ([]byte, error) {
+	return a.client.GetData(ctx, key)
+}
+
+func (a *revproxyModproxyAdapter) Put(ctx context.Context, key string, data io.Reader) error {
+	return a.client.Put(ctx, key, data)
+}
+
+func mapToModproxyClient(c revproxy.CacheClient) modproxy.CacheClient {
+	if c == nil {
+		return nil
+	}
+	return &revproxyModproxyAdapter{client: c}
 }
 
 // initModProxy initializes a Go module proxy if one is enabled. If not, it
 // returns a nil handler without error. The caller must defer a call to the
 // cleanup function unless an error is reported.
-func initModProxy(env *command.Env, gcsClient *gcsutil.Client) (_ http.Handler, cleanup func(), _ error) {
+func initModProxy(env *command.Env, client revproxy.CacheClient) (_ http.Handler, cleanup func(), _ error) {
 	if !serveFlags.ModProxy {
 		return nil, noop, nil // OK, proxy is disabled
 	} else if serveFlags.HTTP == "" {
@@ -117,10 +285,13 @@ func initModProxy(env *command.Env, gcsClient *gcsutil.Client) (_ http.Handler, 
 	if err := os.MkdirAll(modCachePath, 0755); err != nil {
 		return nil, nil, fmt.Errorf("create module cache: %w", err)
 	}
-	// In a real implementation, we would use a GCS-based cacher
-	// For now, we'll create a stub that returns not implemented
-	cacher := &modproxy.S3Cacher{}
-	// TODO: Implement a GCS-based cacher
+	// Create the module cacher with the appropriate storage backend
+	cacher := &modproxy.S3Cacher{
+		Local:     modCachePath,
+		Client:    mapToModproxyClient(client),
+		KeyPrefix: path.Join(flags.KeyPrefix, "module"),
+		Logf:      vprintf,
+	}
 	cleanup = func() { vprintf("close cacher (err=%v)", cacher.Close()) }
 	proxy := &goproxy.Goproxy{
 		Fetcher: &goproxy.GoFetcher{
@@ -175,7 +346,7 @@ func initModProxy(env *command.Env, gcsClient *gcsutil.Client) (_ http.Handler, 
 // To the main HTTP listener, the bridge is an [http.Handler] that serves
 // requests routed to it. To the inner server, the bridge is a [net.Listener],
 // a source of client connections (with TLS terminated).
-func initRevProxy(env *command.Env, gcsClient *gcsutil.Client, g *taskgroup.Group) (http.Handler, error) {
+func initRevProxy(env *command.Env, storageClient revproxy.CacheClient, g *taskgroup.Group) (http.Handler, error) {
 	if serveFlags.RevProxy == "" {
 		return nil, nil // OK, proxy is disabled
 	} else if serveFlags.HTTP == "" {
@@ -194,12 +365,10 @@ func initRevProxy(env *command.Env, gcsClient *gcsutil.Client, g *taskgroup.Grou
 		return nil, err
 	}
 
-	// In a real implementation, we would use a GCS-based proxy
-	// For now, we'll use the existing S3 fields as placeholders
 	proxy := &revproxy.Server{
 		Targets:     hosts,
 		Local:       revCachePath,
-		// TODO: Implement a GCS field in revproxy.Server
+		Storage:     storageClient,
 		KeyPrefix:   path.Join(flags.KeyPrefix, "revproxy"),
 		Logf:        vprintf,
 		LogRequests: flags.DebugLog&debugRevProxy != 0,
