@@ -155,7 +155,7 @@ func initCacheServer(env *command.Env) (*gocache.Server, revproxy.CacheClient, e
 		// Create S3 cache for gocache
 		s3Cache := &gobuild.S3Cache{
 			Local:             dir,
-			Client:           s3Client,
+			S3Client:          s3Client,
 			KeyPrefix:         flags.KeyPrefix,
 			MinUploadSize:     flags.MinUploadSize,
 			UploadConcurrency: flags.S3Concurrency,
