@@ -5,11 +5,9 @@ package gobuild
 
 import (
 	"context"
-	"crypto/md5"
 	"errors"
 	"expvar"
 	"fmt"
-	"io"
 	"io/fs"
 	"os"
 	"path"
@@ -24,33 +22,58 @@ import (
 	"github.com/tailscale/go-cache-plugin/lib/gcsutil"
 )
 
-// GCSCache is a cache implementation that stores cached files in a local directory and
-// also stores cached files in a remote GCS bucket.
+// GCSCache implements callbacks for a gocache.Server using a GCS bucket for
+// backing store with a local directory for staging.
+//
+// # Remote Cache Layout
+//
+// Within the designated GCS bucket, keys are organized into two groups. Each
+// action is stored in a file named:
+//
+//	[<prefix>/]action/<xx>/<action-id>
+//
+// Each output object is stored in a file named:
+//
+//	[<prefix>/]output/<xx>/<object-id>
+//
+// The object and action IDs are encoded as lower-case hexadecimal strings,
+// with "<xx>" denoting the first two bytes of the ID to partition the space.
+//
+// The contents of each action file have the format:
+//
+//	<output-id> <timestamp>
+//
+// where the object ID is hex encoded and the timestamp is Unix nanoseconds.
+// The object file contains just the binary data of the object.
 type GCSCache struct {
 	// Local is the local cache directory where actions and objects are staged.
 	// It must be non-nil. A local stage is required because the Go toolchain
-	// needs direct access to read the files reported by the cache
+	// needs direct access to read the files reported by the cache.
+	// It is safe to use a tmpfs directory.
 	Local *cachedir.Dir
 
-	// GCS is the remote GCS bucket where actions and objects are stored.
-	// It must be non-nil.
+	// GCSClient is the GCS client used to read and write cache entries to the
+	// backing store. It must be non-nil.
 	GCSClient *gcsutil.Client
 
-	// KeyPrefix is the prefix used for keys in the GCS bucket.
+	// KeyPrefix, if non-empty, is prepended to each key stored into GCS, with an
+	// intervening slash.
 	KeyPrefix string
 
-	// MinUploadSize is the minimum size of a file to upload to GCS.
+	// MinUploadSize, if positive, defines a minimum object size in bytes below
+	// which the cache will not write the object to GCS.
 	MinUploadSize int64
 
-	// UploadConcurrency is the number of concurrent uploads to GCS.
+	// UploadConcurrency, if positive, defines the maximum number of concurrent
+	// tasks for writing cache entries to GCS.  If zero or negative, it uses
+	// runtime.NumCPU.
 	UploadConcurrency int
 
-	// Tracks tasks pushing cache writes to GCS
+	// Tracks tasks pushing cache writes to GCS.
 	initOnce sync.Once
 	push     *taskgroup.Group
 	start    func(taskgroup.Task)
 
-	// Metrics
 	getLocalHit  expvar.Int // count of Get hits in the local cache
 	getFaultHit  expvar.Int // count of Get hits faulted in from GCS
 	getFaultMiss expvar.Int // count of Get faults that were misses
@@ -61,42 +84,29 @@ type GCSCache struct {
 	putGCSError  expvar.Int // count of errors writing to GCS
 }
 
-// init initializes the GCSCache.
 func (s *GCSCache) init() {
-	// Initialize the push group.
-	// Only executes once.
 	s.initOnce.Do(func() {
 		s.push, s.start = taskgroup.New(nil).Limit(s.uploadConcurrency())
 	})
 }
 
-// uploadConcurrency returns the number of concurrent uploads to GCS.
-func (s *GCSCache) uploadConcurrency() int {
-	if s.UploadConcurrency > 0 {
-		return s.UploadConcurrency
-	}
-	return runtime.NumCPU()
-}
-
-func (s *GCSCache) Get(ctx context.Context, actionID string) (outputId, diskPath string, _ error) {
-	// Initialize the GCSCache.
+// Get implements the corresponding callback of the cache protocol.
+func (s *GCSCache) Get(ctx context.Context, actionID string) (outputID, diskPath string, _ error) {
 	s.init()
 
-	// Try to get the object from the local cache.
-	objID, dPath, err := s.Local.Get(ctx, actionID)
-	if err == nil && objID != "" && dPath != "" {
+	objID, diskPath, err := s.Local.Get(ctx, actionID)
+	if err == nil && objID != "" && diskPath != "" {
 		s.getLocalHit.Add(1)
-		// cache hit, return the object ID and disk path.
-		return objID, dPath, nil
+		return objID, diskPath, nil // cache hit, OK
 	}
 
-	// Either we failed to get the object from the local cache, or the object does not exist.
-	// Try to get the object from the remote GCS bucket.
+	// Reaching here, either we got a cache miss or an error reading from local.
+	// Try reading the action from GCS.
 	action, err := s.GCSClient.GetData(ctx, s.actionKey(actionID))
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			s.getFaultMiss.Add(1)
-			return "", "", nil
+			return "", "", nil // cache miss, OK
 		}
 		return "", "", fmt.Errorf("[gcs] read action %s: %w", actionID, err)
 	}
@@ -132,100 +142,92 @@ func (s *GCSCache) Get(ctx context.Context, actionID string) (outputId, diskPath
 func (s *GCSCache) Put(ctx context.Context, obj gocache.Object) (diskPath string, _ error) {
 	s.init()
 
-	// Compute an MD5 hash so we can do a conditional put on the object data.
-	h := md5.New()
-	obj.Body = io.TeeReader(obj.Body, h)
-
 	diskPath, err := s.Local.Put(ctx, obj)
 	if err != nil {
 		return "", err // don't bother trying to forward it to the remote
 	}
 	if obj.Size < s.MinUploadSize {
 		s.putSkipSmall.Add(1)
-		return diskPath, nil
+		return diskPath, nil // don't bother uploading this, it's too small
 	}
 
-	// Make a file copy of the output data to write to GCS. At this point we've
-	// already computed the hash (above) and written the data to the local cache,
-	// so we can afford to be a bit lazy here.
-	f, err := os.Open(diskPath)
-	if err != nil {
-		return diskPath, nil
-	}
-
-	// Don't hold up the caller waiting for GCS to be updated; the data are safe in
-	// the local cache.
-	actionID, outputID := obj.ActionID, obj.OutputID
-	hash := fmt.Sprintf("%x", h.Sum(nil))
-
-	// Ctx is from the outer function signature: func (s *GCSCache) Put(ctx context.Context, ...).
-	bgctx := context.Background()
-
+	// Try to push the record to GCS in the background.
 	s.start(func() error {
-		// Give the background task its own timeout, like in S3 code.
-		sctx, cancel := context.WithTimeout(bgctx, 1*time.Minute)
+		// Override the context with a separate timeout in case GCS is farkakte.
+		_, cancel := context.WithTimeout(context.WithoutCancel(ctx), 1*time.Minute)
 		defer cancel()
 
-		data := fmt.Sprintf("%s %d", outputID, obj.ModTime.Unix())
-		if _, err := s.GCSClient.PutCond(sctx, s.actionKey(actionID), "", strings.NewReader(data)); err != nil {
+		// Stage 1: Write the object. Do this before writing the action
+		// record so we are less likely to get a spurious miss later.
+		f, err := os.Open(diskPath)
+		if err != nil {
 			s.putGCSError.Add(1)
-			gocache.Logf(sctx, "[gcs] write action %s: %v", actionID, err)
-			return fmt.Errorf("[gcs] write action %s: %w", actionID, err)
+			gocache.Logf(ctx, "[gcs] open local object %s: %v", obj.OutputID, err)
+			return err
+		}
+		defer f.Close()
+		fi, err := f.Stat()
+		if err != nil {
+			s.putGCSError.Add(1)
+			gocache.Logf(ctx, "[gcs] stat local object %s: %v", obj.OutputID, err)
+			return err
+		}
+
+		if err := s.GCSClient.Put(ctx, s.outputKey(obj.OutputID), f); err != nil {
+			s.putGCSError.Add(1)
+			gocache.Logf(ctx, "[gcs] put object %s: %v", obj.OutputID, err)
+			return err
+		}
+		s.putGCSObject.Add(1)
+
+		// Stage 2: Write the action record.
+		if err := s.GCSClient.Put(ctx, s.actionKey(obj.ActionID),
+			strings.NewReader(fmt.Sprintf("%s %d", obj.OutputID, fi.ModTime().UnixNano()))); err != nil {
+			gocache.Logf(ctx, "[gcs] write action %s: %v", obj.ActionID, err)
+			return err
 		}
 		s.putGCSAction.Add(1)
-
-		if ok, err := s.GCSClient.PutCond(sctx, s.outputKey(outputID), hash, f); err != nil {
-			s.putGCSError.Add(1)
-			gocache.Logf(sctx, "[gcs] write object %s: %v", outputID, err)
-			return fmt.Errorf("[gcs] write object %s: %w", outputID, err)
-		} else if !ok {
-			s.putGCSFound.Add(1)
-		} else {
-			s.putGCSObject.Add(1)
-		}
-		f.Close()
 		return nil
 	})
+
 	return diskPath, nil
-}
-
-// SetMetrics publishes the metrics collected by s to r.
-func (s *GCSCache) SetMetrics(_ context.Context, r *expvar.Map) {
-	r.Set("get_local_hit", &s.getLocalHit)
-	r.Set("get_fault_hit", &s.getFaultHit)
-	r.Set("get_fault_miss", &s.getFaultMiss)
-	r.Set("put_skip_small", &s.putSkipSmall)
-	r.Set("put_gcs_found", &s.putGCSFound)
-	r.Set("put_gcs_action", &s.putGCSAction)
-	r.Set("put_gcs_object", &s.putGCSObject)
-	r.Set("put_gcs_error", &s.putGCSError)
-}
-
-// actionKey constructs the GCS key path for an action ID.
-func (s *GCSCache) actionKey(actionID string) string {
-	key := path.Join("action", actionID[:2], actionID[2:])
-	if s.KeyPrefix != "" {
-		key = path.Join(s.KeyPrefix, key)
-	}
-	return key
-}
-
-// outputKey constructs the GCS key path for an output ID.
-func (s *GCSCache) outputKey(outputID string) string {
-	key := path.Join("object", outputID[:2], outputID[2:])
-	if s.KeyPrefix != "" {
-		key = path.Join(s.KeyPrefix, key)
-	}
-	return key
 }
 
 // Close implements the corresponding callback of the cache protocol.
 func (s *GCSCache) Close(ctx context.Context) error {
-	s.init()
-	s.push.Wait() // wait for any remaining uploads to complete
-
-	if err := s.GCSClient.Close(); err != nil {
-		return fmt.Errorf("[gcs] close client: %w", err)
+	if s.push != nil {
+		gocache.Logf(ctx, "waiting for uploads...")
+		wstart := time.Now()
+		s.push.Wait()
+		gocache.Logf(ctx, "uploads complete (%v elapsed)", time.Since(wstart).Round(10*time.Microsecond))
 	}
-	return nil
+	return s.GCSClient.Close()
+}
+
+// SetMetrics implements the corresponding server callback.
+func (s *GCSCache) SetMetrics(_ context.Context, m *expvar.Map) {
+	m.Set("get_local_hit", &s.getLocalHit)
+	m.Set("get_fault_hit", &s.getFaultHit)
+	m.Set("get_fault_miss", &s.getFaultMiss)
+	m.Set("put_skip_small", &s.putSkipSmall)
+	m.Set("put_gcs_found", &s.putGCSFound)
+	m.Set("put_gcs_action", &s.putGCSAction)
+	m.Set("put_gcs_object", &s.putGCSObject)
+	m.Set("put_gcs_error", &s.putGCSError)
+}
+
+// makeKey assembles a complete key from the specified parts, including the key
+// prefix if one is defined.
+func (s *GCSCache) makeKey(parts ...string) string {
+	return path.Join(s.KeyPrefix, path.Join(parts...))
+}
+
+func (s *GCSCache) actionKey(id string) string { return s.makeKey("action", id[:2], id) }
+func (s *GCSCache) outputKey(id string) string { return s.makeKey("output", id[:2], id) }
+
+func (s *GCSCache) uploadConcurrency() int {
+	if s.UploadConcurrency <= 0 {
+		return runtime.NumCPU()
+	}
+	return s.UploadConcurrency
 }

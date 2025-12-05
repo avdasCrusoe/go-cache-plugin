@@ -1,88 +1,67 @@
 // Copyright (c) Tailscale Inc & AUTHORS
 // SPDX-License-Identifier: BSD-3-Clause
 
+// Package gcsutil provides a client for Google Cloud Storage operations.
 package gcsutil
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"io/fs"
-	"os"
+	"sync"
 
 	"cloud.google.com/go/storage"
+	"google.golang.org/api/googleapi"
 	"google.golang.org/api/option"
 )
 
-// Reports whether err indicates the requested resource was not found.
-func IsNotExist(err error) bool {
-	return err == storage.ErrObjectNotExist || os.IsNotExist(err)
-}
-
-// Client is a wrapper for a GCS client that provides basic read and write
-// facilities to a specific bucket.
+// Client is a wrapper for Google Cloud Storage operations.
 type Client struct {
-	Client *storage.Client
-	Bucket string
+	client *storage.Client
+	bucket string
+	mu     sync.Mutex
 }
 
-// NewClient creates a new GCS client for the specified bucket.
+// NewClient creates a new GCS client targeting the specified bucket.
 func NewClient(ctx context.Context, bucket string, opts ...option.ClientOption) (*Client, error) {
 	client, err := storage.NewClient(ctx, opts...)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create GCS client: %w", err)
+		return nil, fmt.Errorf("create GCS client: %w", err)
 	}
-
 	return &Client{
-		Client: client,
-		Bucket: bucket,
+		client: client,
+		bucket: bucket,
 	}, nil
 }
 
-// Put writes the specified data to GCS under the given key.
-func (c *Client) Put(ctx context.Context, key string, data io.Reader) error {
-	wc := c.Client.Bucket(c.Bucket).Object(key).NewWriter(ctx)
-
-	// Copy the data to the writer.
-	if _, err := io.Copy(wc, data); err != nil {
-		wc.Close()
-		return fmt.Errorf("write to GCS: %w", err)
-	}
-
-	// Close the writer.
-	if err := wc.Close(); err != nil {
-		return fmt.Errorf("close GCS writer: %w", err)
-	}
-	return nil
-}
-
-// Get returns the contents of the specified key from GCS.
-// If the key is not found, the resulting error satisfies fs.ErrNotExist.
+// Get retrieves the object with the given key from GCS.
+// The caller must close the returned reader when done.
 func (c *Client) Get(ctx context.Context, key string) (io.ReadCloser, int64, error) {
-	// Get the object.
-	obj := c.Client.Bucket(c.Bucket).Object(key)
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
-	// Check if object exists.
+	obj := c.client.Bucket(c.bucket).Object(key)
 	attrs, err := obj.Attrs(ctx)
 	if err != nil {
-		// If the object does not exist, return fs.ErrNotExist.
-		if errors.Is(err, storage.ErrObjectNotExist) {
-			return nil, -1, fmt.Errorf("key %q: %w", key, fs.ErrNotExist)
+		if err == storage.ErrObjectNotExist {
+			return nil, 0, fs.ErrNotExist
 		}
-		// Otherwise, return the error.
-		return nil, -1, err
+		return nil, 0, err
 	}
 
-	// Otherwise, return the reader and the size.
 	r, err := obj.NewReader(ctx)
 	if err != nil {
-		return nil, -1, err
+		if err == storage.ErrObjectNotExist {
+			return nil, 0, fs.ErrNotExist
+		}
+		return nil, 0, err
 	}
+
 	return r, attrs.Size, nil
 }
 
-// GetData returns the contents of the specified key from GCS as a byte slice.
+// GetData returns the complete content of the object with the given key.
 func (c *Client) GetData(ctx context.Context, key string) ([]byte, error) {
 	r, _, err := c.Get(ctx, key)
 	if err != nil {
@@ -92,35 +71,57 @@ func (c *Client) GetData(ctx context.Context, key string) ([]byte, error) {
 	return io.ReadAll(r)
 }
 
-// PutCond writes the specified data to GCS under the given key if the key does
-// not already exist, or if its content differs from the given md5 hash.
-// The md5 hash is an MD5 of the expected contents, encoded as lowercase hex digits.
-func (c *Client) PutCond(ctx context.Context, key, md5hash string, data io.Reader) (written bool, _ error) {
-	// Get the object.
-	obj := c.Client.Bucket(c.Bucket).Object(key)
+// Put writes the data from the provided reader to the object with the given key.
+func (c *Client) Put(ctx context.Context, key string, data io.Reader) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
-	// Check if object exists.
+	w := c.client.Bucket(c.bucket).Object(key).NewWriter(ctx)
+	_, err := io.Copy(w, data)
+	if err != nil {
+		w.Close()
+		return err
+	}
+	return w.Close()
+}
+
+// PutCond performs a conditional put operation for the object with the given key.
+// It only writes the data if the object doesn't exist or has a different content hash.
+func (c *Client) PutCond(ctx context.Context, key, contentHash string, data io.Reader) (bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	obj := c.client.Bucket(c.bucket).Object(key)
 	attrs, err := obj.Attrs(ctx)
-	if err == nil && attrs.MD5 != nil {
-		// Object exists, check if MD5 matches
-		existingMD5 := fmt.Sprintf("%x", attrs.MD5)
-		if existingMD5 == md5hash {
-			return false, nil
-		}
-	} else if err != nil && !errors.Is(err, storage.ErrObjectNotExist) {
-		// Some error other than "object does not exist" occurred.
-		return false, err
+	if err == nil && attrs.Etag == contentHash {
+		// Object exists with same hash, no need to upload
+		return false, nil
 	}
 
-	// Object does not exist, write it.
-	if err := c.Put(ctx, key, data); err != nil {
+	w := obj.NewWriter(ctx)
+	_, err = io.Copy(w, data)
+	if err != nil {
+		w.Close()
 		return false, err
 	}
-	// Object was written.
+	if err := w.Close(); err != nil {
+		return false, err
+	}
 	return true, nil
 }
 
-// Close closes the GCS client.
+// Close closes the GCS client and releases resources.
 func (c *Client) Close() error {
-	return c.Client.Close()
+	return c.client.Close()
+}
+
+// IsNotExist reports whether err indicates that a file or directory does not exist.
+func IsNotExist(err error) bool {
+	if err == fs.ErrNotExist {
+		return true
+	}
+	if err, ok := err.(*googleapi.Error); ok {
+		return err.Code == 404
+	}
+	return false
 }
