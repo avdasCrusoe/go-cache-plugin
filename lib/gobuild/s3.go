@@ -22,6 +22,7 @@ import (
 	"github.com/creachadair/gocache"
 	"github.com/creachadair/gocache/cachedir"
 	"github.com/creachadair/taskgroup"
+	"github.com/tailscale/go-cache-plugin/lib/revproxy"
 	"github.com/tailscale/go-cache-plugin/lib/s3util"
 )
 
@@ -86,6 +87,8 @@ type S3Cache struct {
 	putS3Object  expvar.Int // count of objects written to S3
 	putS3Error   expvar.Int // count of errors writing to S3
 }
+
+var _ revproxy.Storage = (*S3Cache)(nil)
 
 func (s *S3Cache) init() {
 	s.initOnce.Do(func() {

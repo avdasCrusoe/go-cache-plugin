@@ -23,24 +23,24 @@ import (
 )
 
 var flags struct {
-	CacheDir      string        `flag:"cache-dir,default=$GOCACHE_DIR,Local cache directory (required)"`
-	
+	CacheDir string `flag:"cache-dir,default=$GOCACHE_DIR,Local cache directory (required)"`
+
 	// Storage backend configuration
-	StorageBackend string        `flag:"storage,default=$GOCACHE_STORAGE_BACKEND,Storage backend to use: 's3' or 'gcs'"`
-	Bucket        string        `flag:"bucket,default=$GOCACHE_BUCKET,Bucket name (backward compatibility)"`
-	
+	StorageBackend string `flag:"storage,default=$GOCACHE_STORAGE_BACKEND,Storage backend to use: 's3' or 'gcs'"`
+	Bucket         string `flag:"bucket,default=$GOCACHE_BUCKET,Bucket name (backward compatibility)"`
+
 	// S3 configuration
-	S3Bucket      string        `flag:"s3-bucket,default=$GOCACHE_S3_BUCKET,S3 bucket name"`
-	S3Region      string        `flag:"region,default=$GOCACHE_S3_REGION,S3 region"`
-	S3Endpoint    string        `flag:"s3-endpoint-url,default=$GOCACHE_S3_ENDPOINT_URL,S3 custom endpoint URL (if unset, use AWS default)"`
-	S3PathStyle   bool          `flag:"s3-path-style,default=$GOCACHE_S3_PATH_STYLE,S3 path-style URLs (optional)"`
-	S3Concurrency int           `flag:"u,default=$GOCACHE_S3_CONCURRENCY,Maximum concurrency for upload to S3"`
-	
+	S3Bucket      string `flag:"s3-bucket,default=$GOCACHE_S3_BUCKET,S3 bucket name"`
+	S3Region      string `flag:"region,default=$GOCACHE_S3_REGION,S3 region"`
+	S3Endpoint    string `flag:"s3-endpoint-url,default=$GOCACHE_S3_ENDPOINT_URL,S3 custom endpoint URL (if unset, use AWS default)"`
+	S3PathStyle   bool   `flag:"s3-path-style,default=$GOCACHE_S3_PATH_STYLE,S3 path-style URLs (optional)"`
+	S3Concurrency int    `flag:"u,default=$GOCACHE_S3_CONCURRENCY,Maximum concurrency for upload to S3"`
+
 	// GCS configuration
-	GCSBucket     string        `flag:"gcs-bucket,default=$GOCACHE_GCS_BUCKET,GCS bucket name"`
-	GCSKeyFile    string        `flag:"gcs-key-file,default=$GOCACHE_GCS_KEY_FILE,Path to GCS service account key file"`
-	GCSConcurrency int          `flag:"gcs-concurrency,default=$GOCACHE_GCS_CONCURRENCY,Maximum concurrency for upload to GCS"`
-	
+	GCSBucket      string `flag:"gcs-bucket,default=$GOCACHE_GCS_BUCKET,GCS bucket name"`
+	GCSKeyFile     string `flag:"gcs-key-file,default=$GOCACHE_GCS_KEY_FILE,Path to GCS service account key file"`
+	GCSConcurrency int    `flag:"gcs-concurrency,default=$GOCACHE_GCS_CONCURRENCY,Maximum concurrency for upload to GCS"`
+
 	// Common configuration
 	KeyPrefix     string        `flag:"prefix,default=$GOCACHE_KEY_PREFIX,Key prefix for storage objects (optional)"`
 	MinUploadSize int64         `flag:"min-upload-size,default=$GOCACHE_MIN_SIZE,Minimum object size to upload to storage (in bytes)"`
@@ -91,7 +91,7 @@ func runServe(env *command.Env) error {
 
 	// Initialize the cache server. Unlike a direct server, only close down and
 	// wait for cache cleanup when the whole process exits.
-	s, s3c, err := initCacheServer(env)
+	s, storageClient, err := initCacheServer(env)
 	if err != nil {
 		return err
 	}
@@ -116,7 +116,7 @@ func runServe(env *command.Env) error {
 	})
 
 	// If a module proxy is enabled, start it.
-	modProxy, modCleanup, err := initModProxy(env.SetContext(ctx), s3c)
+	modProxy, modCleanup, err := initModProxy(env.SetContext(ctx), storageClient)
 	if err != nil {
 		lst.Close()
 		return fmt.Errorf("module proxy: %w", err)
@@ -124,7 +124,7 @@ func runServe(env *command.Env) error {
 	defer modCleanup()
 
 	// If a reverse proxy is enabled, start it.
-	revProxy, err := initRevProxy(env.SetContext(ctx), s3c, &g)
+	revProxy, err := initRevProxy(env.SetContext(ctx), storageClient, &g)
 	if err != nil {
 		lst.Close()
 		return fmt.Errorf("reverse proxy: %w", err)

@@ -20,6 +20,7 @@ import (
 	"github.com/creachadair/gocache/cachedir"
 	"github.com/creachadair/taskgroup"
 	"github.com/tailscale/go-cache-plugin/lib/gcsutil"
+	"github.com/tailscale/go-cache-plugin/lib/revproxy"
 )
 
 // GCSCache implements callbacks for a gocache.Server using a GCS bucket for
@@ -83,6 +84,8 @@ type GCSCache struct {
 	putGCSObject expvar.Int // count of objects written to GCS
 	putGCSError  expvar.Int // count of errors writing to GCS
 }
+
+var _ revproxy.Storage = (*GCSCache)(nil)
 
 func (s *GCSCache) init() {
 	s.initOnce.Do(func() {

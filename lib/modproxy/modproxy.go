@@ -24,86 +24,13 @@ import (
 	"github.com/creachadair/atomicfile"
 	"github.com/creachadair/taskgroup"
 	"github.com/goproxy/goproxy"
-	"github.com/tailscale/go-cache-plugin/lib/gcsutil"
-	"github.com/tailscale/go-cache-plugin/lib/s3util"
+	"github.com/tailscale/go-cache-plugin/lib/revproxy"
 	"golang.org/x/sync/semaphore"
 )
 
-var _ goproxy.Cacher = (*S3Cacher)(nil)
+var _ goproxy.Cacher = (*StorageCacher)(nil)
 
-// CacheClient defines the interface for storage backends used by the modproxy
-// to persist cached responses in remote storage (such as S3 or GCS).
-type CacheClient interface {
-	// Get retrieves the object with the given key from the remote storage.
-	// Returns a ReadCloser for the object data, the size of the object, and any error.
-	// The caller must close the returned ReadCloser when done.
-	Get(ctx context.Context, key string) (io.ReadCloser, int64, error)
-
-	// GetData is a convenience method that returns the complete content of the object
-	// with the given key as a byte slice.
-	GetData(ctx context.Context, key string) ([]byte, error)
-
-	// Put writes the data from the provided reader to the object with the given key.
-	// Returns an error if the operation fails.
-	Put(ctx context.Context, key string, data io.Reader) error
-}
-
-// S3Adapter wraps an s3util.Client to implement the CacheClient interface.
-type S3Adapter struct {
-	Client *s3util.Client
-}
-
-// NewS3Adapter creates a new S3Adapter that implements CacheClient.
-func NewS3Adapter(client *s3util.Client) *S3Adapter {
-	return &S3Adapter{Client: client}
-}
-
-// Get retrieves the object with the given key from S3.
-func (a *S3Adapter) Get(ctx context.Context, key string) (io.ReadCloser, int64, error) {
-	return a.Client.Get(ctx, key)
-}
-
-// GetData returns the complete content of the object with the given key from S3.
-func (a *S3Adapter) GetData(ctx context.Context, key string) ([]byte, error) {
-	return a.Client.GetData(ctx, key)
-}
-
-// Put writes the data from the provided reader to S3 with the given key.
-func (a *S3Adapter) Put(ctx context.Context, key string, data io.Reader) error {
-	return a.Client.Put(ctx, key, data)
-}
-
-// GCSAdapter wraps a gcsutil.Client to implement the CacheClient interface.
-type GCSAdapter struct {
-	Client *gcsutil.Client
-}
-
-// NewGCSAdapter creates a new GCSAdapter that implements CacheClient.
-func NewGCSAdapter(client *gcsutil.Client) *GCSAdapter {
-	return &GCSAdapter{Client: client}
-}
-
-// Get retrieves the object with the given key from GCS.
-func (a *GCSAdapter) Get(ctx context.Context, key string) (io.ReadCloser, int64, error) {
-	return a.Client.Get(ctx, key)
-}
-
-// GetData returns the complete content of the object with the given key from GCS.
-func (a *GCSAdapter) GetData(ctx context.Context, key string) ([]byte, error) {
-	return a.Client.GetData(ctx, key)
-}
-
-// Put writes the data from the provided reader to GCS with the given key.
-func (a *GCSAdapter) Put(ctx context.Context, key string, data io.Reader) error {
-	return a.Client.Put(ctx, key, data)
-}
-
-// IsStorageNotExist returns true if the error indicates that the object doesn't exist in storage.
-func IsStorageNotExist(err error) bool {
-	return s3util.IsNotExist(err) || gcsutil.IsNotExist(err) || err == fs.ErrNotExist
-}
-
-// S3Cacher implements the [github.com/goproxy/goproxy.Cacher] interface using
+// StorageCacher implements the [github.com/goproxy/goproxy.Cacher] interface using
 // a local disk cache backed by a cloud storage bucket (S3 or GCS).
 //
 // # Cache Layout
@@ -121,14 +48,14 @@ func IsStorageNotExist(err error) bool {
 // the specified key prefix instead:
 //
 //	<key-prefix>/module/16/0db4d719252162c87a9169e26deda33d2340770d0d540fd4c580c55008b2d6
-type S3Cacher struct {
+type StorageCacher struct {
 	// Local is the path of a local cache directory where modules are cached.
 	// It must be non-empty.
 	Local string
 
 	// Client is the storage client used to read and write cache entries to the
 	// backing store (S3 or GCS). It must be non-nil.
-	Client CacheClient
+	Client revproxy.CacheClient
 
 	// KeyPrefix, if non-empty, is prepended to each key stored in storage, with an
 	// intervening slash.
@@ -169,25 +96,25 @@ type S3Cacher struct {
 	start    func(taskgroup.Task)
 	sema     *semaphore.Weighted
 
-	pathError     expvar.Int // errors constructing file paths
-	getRequest    expvar.Int // total number of Get requests
-	getLocalHit   expvar.Int // get: hit in local directory
-	getLocalMiss  expvar.Int // get: miss in local directory
-	getFaultHit   expvar.Int // get: hit in remote storage
-	getFaultMiss  expvar.Int // get: miss in remote storage
-	getLocalError expvar.Int // get: error reading the local directory
-	getFaultError expvar.Int // get: error reading from storage
-	getLocalBytes expvar.Int // get: total bytes fetched from the local directory
+	pathError       expvar.Int // errors constructing file paths
+	getRequest      expvar.Int // total number of Get requests
+	getLocalHit     expvar.Int // get: hit in local directory
+	getLocalMiss    expvar.Int // get: miss in local directory
+	getFaultHit     expvar.Int // get: hit in remote storage
+	getFaultMiss    expvar.Int // get: miss in remote storage
+	getLocalError   expvar.Int // get: error reading the local directory
+	getFaultError   expvar.Int // get: error reading from storage
+	getLocalBytes   expvar.Int // get: total bytes fetched from the local directory
 	getStorageBytes expvar.Int // get: total bytes fetched from storage
-	putRequest    expvar.Int // total number of Put requests
-	putLocalHit   expvar.Int // put: put of object already stored locally
-	putLocalError expvar.Int // put: error writing the local directory
+	putRequest      expvar.Int // total number of Put requests
+	putLocalHit     expvar.Int // put: put of object already stored locally
+	putLocalError   expvar.Int // put: error writing the local directory
 	putStorageError expvar.Int // put: error writing to storage
-	putLocalBytes expvar.Int // put: total bytes written to the local directory
+	putLocalBytes   expvar.Int // put: total bytes written to the local directory
 	putStorageBytes expvar.Int // put: total bytes written to storage
 }
 
-func (c *S3Cacher) init() {
+func (c *StorageCacher) init() {
 	c.initOnce.Do(func() {
 		nt := c.MaxTasks
 		if nt <= 0 {
@@ -200,7 +127,7 @@ func (c *S3Cacher) init() {
 
 // Get implements a method of the goproxy.Cacher interface.  It reports cache
 // hits out of the local directory if available, or faults in from S3.
-func (c *S3Cacher) Get(ctx context.Context, name string) (_ io.ReadCloser, oerr error) {
+func (c *StorageCacher) Get(ctx context.Context, name string) (_ io.ReadCloser, oerr error) {
 	c.init()
 	c.getRequest.Add(1)
 	start := time.Now()
@@ -252,7 +179,7 @@ func (c *S3Cacher) Get(ctx context.Context, name string) (_ io.ReadCloser, oerr 
 
 // putLocal reports whether the specified path already exists in the local
 // cache, and if not, writes data atomically into the path.
-func (c *S3Cacher) putLocal(ctx context.Context, name, path string, data io.Reader) (bool, error) {
+func (c *StorageCacher) putLocal(ctx context.Context, name, path string, data io.Reader) (bool, error) {
 	if _, err := os.Stat(path); err == nil {
 		return true, nil
 	}
@@ -266,7 +193,7 @@ func (c *S3Cacher) putLocal(ctx context.Context, name, path string, data io.Read
 
 // Put implements a method of the goproxy.Cacher interface. It stores data into
 // the local directory and then writes it back to S3 in the background.
-func (c *S3Cacher) Put(ctx context.Context, name string, data io.ReadSeeker) (oerr error) {
+func (c *StorageCacher) Put(ctx context.Context, name string, data io.ReadSeeker) (oerr error) {
 	c.init()
 	c.putRequest.Add(1)
 	start := time.Now()
@@ -313,14 +240,14 @@ func (c *S3Cacher) Put(ctx context.Context, name string, data io.ReadSeeker) (oe
 }
 
 // Close waits until all background updates are complete.
-func (c *S3Cacher) Close() error {
+func (c *StorageCacher) Close() error {
 	c.init()
 	return c.tasks.Wait()
 }
 
 // Metrics returns a map of cacher metrics. The caller is responsible for
 // publishing these metrics.
-func (c *S3Cacher) Metrics() *expvar.Map {
+func (c *StorageCacher) Metrics() *expvar.Map {
 	m := new(expvar.Map)
 	m.Set("path_error", &c.pathError)
 	m.Set("get_request", &c.getRequest)
@@ -346,13 +273,13 @@ func hashName(name string) string {
 
 // makeKey assembles a complete storage key from the specified parts, including the
 // key prefix if one is defined.
-func (c *S3Cacher) makeKey(hash string) string {
+func (c *StorageCacher) makeKey(hash string) string {
 	return path.Join(c.KeyPrefix, hash[:2], hash)
 }
 
 // makePath assembles a complete local cache path for the given name, creating
 // the enclosing directory if needed.
-func (c *S3Cacher) makePath(name string) (hash, path string, err error) {
+func (c *StorageCacher) makePath(name string) (hash, path string, err error) {
 	hash = hashName(name)
 	path = filepath.Join(c.Local, hash[:2], hash)
 	err = os.MkdirAll(filepath.Dir(path), 0755)
@@ -362,13 +289,13 @@ func (c *S3Cacher) makePath(name string) (hash, path string, err error) {
 	return hash, path, err
 }
 
-func (c *S3Cacher) logf(msg string, args ...any) {
+func (c *StorageCacher) logf(msg string, args ...any) {
 	if c.Logf != nil {
 		c.Logf(msg, args...)
 	}
 }
 
-func (c *S3Cacher) vlogf(msg string, args ...any) {
+func (c *StorageCacher) vlogf(msg string, args ...any) {
 	if c.LogRequests {
 		c.logf(msg, args...)
 	}
