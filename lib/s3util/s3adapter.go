@@ -19,8 +19,6 @@ func NewS3Adapter(client *Client) *S3Adapter {
 	return &S3Adapter{Client: client}
 }
 
-var _ revproxy.CacheClient = (*S3Adapter)(nil)
-
 // Get retrieves the object with the given key from S3.
 func (a *S3Adapter) Get(ctx context.Context, key string) (io.ReadCloser, int64, error) {
 	return a.Client.Get(ctx, key)

@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
-	"sync"
 
 	"cloud.google.com/go/storage"
 	"google.golang.org/api/googleapi"
@@ -20,7 +19,6 @@ import (
 type Client struct {
 	client *storage.Client
 	bucket string
-	mu     sync.Mutex
 }
 
 // NewClient creates a new GCS client targeting the specified bucket.
@@ -38,9 +36,6 @@ func NewClient(ctx context.Context, bucket string, opts ...option.ClientOption) 
 // Get retrieves the object with the given key from GCS.
 // The caller must close the returned reader when done.
 func (c *Client) Get(ctx context.Context, key string) (io.ReadCloser, int64, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	obj := c.client.Bucket(c.bucket).Object(key)
 	attrs, err := obj.Attrs(ctx)
 	if err != nil {
@@ -73,9 +68,6 @@ func (c *Client) GetData(ctx context.Context, key string) ([]byte, error) {
 
 // Put writes the data from the provided reader to the object with the given key.
 func (c *Client) Put(ctx context.Context, key string, data io.Reader) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	w := c.client.Bucket(c.bucket).Object(key).NewWriter(ctx)
 	_, err := io.Copy(w, data)
 	if err != nil {
@@ -88,9 +80,6 @@ func (c *Client) Put(ctx context.Context, key string, data io.Reader) error {
 // PutCond performs a conditional put operation for the object with the given key.
 // It only writes the data if the object doesn't exist or has a different content hash.
 func (c *Client) PutCond(ctx context.Context, key, contentHash string, data io.Reader) (bool, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	obj := c.client.Bucket(c.bucket).Object(key)
 	attrs, err := obj.Attrs(ctx)
 	if err == nil && attrs.Etag == contentHash {

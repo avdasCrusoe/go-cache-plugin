@@ -21,6 +21,7 @@ import (
 	"github.com/creachadair/taskgroup"
 	"github.com/tailscale/go-cache-plugin/lib/gcsutil"
 	"github.com/tailscale/go-cache-plugin/lib/revproxy"
+	"github.com/tailscale/go-cache-plugin/lib/s3util"
 )
 
 // GCSCache implements callbacks for a gocache.Server using a GCS bucket for
@@ -145,6 +146,9 @@ func (s *GCSCache) Get(ctx context.Context, actionID string) (outputID, diskPath
 func (s *GCSCache) Put(ctx context.Context, obj gocache.Object) (diskPath string, _ error) {
 	s.init()
 
+	etr := s3util.NewETagReader(obj.Body)
+	obj.Body = etr
+
 	diskPath, err := s.Local.Put(ctx, obj)
 	if err != nil {
 		return "", err // don't bother trying to forward it to the remote
@@ -157,10 +161,10 @@ func (s *GCSCache) Put(ctx context.Context, obj gocache.Object) (diskPath string
 	// Try to push the record to GCS in the background.
 	s.start(func() error {
 		// Override the context with a separate timeout in case GCS is farkakte.
-		_, cancel := context.WithTimeout(context.WithoutCancel(ctx), 1*time.Minute)
+		sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 1*time.Minute)
 		defer cancel()
 
-		// Stage 1: Write the object. Do this before writing the action
+		// Stage 1: Maybe write the object. Do this before writing the action
 		// record so we are less likely to get a spurious miss later.
 		f, err := os.Open(diskPath)
 		if err != nil {
@@ -176,15 +180,22 @@ func (s *GCSCache) Put(ctx context.Context, obj gocache.Object) (diskPath string
 			return err
 		}
 
-		if err := s.GCSClient.Put(ctx, s.outputKey(obj.OutputID), f); err != nil {
+		// Use PutCond to check if object already exists
+		written, err := s.GCSClient.PutCond(sctx, s.outputKey(obj.OutputID), etr.ETag(), f)
+
+		if err != nil {
 			s.putGCSError.Add(1)
 			gocache.Logf(ctx, "[gcs] put object %s: %v", obj.OutputID, err)
 			return err
 		}
-		s.putGCSObject.Add(1)
+		if written {
+			s.putGCSObject.Add(1) // Actually uploaded
+		} else {
+			s.putGCSFound.Add(1) // Duplicate found, skipped upload
+		}
 
 		// Stage 2: Write the action record.
-		if err := s.GCSClient.Put(ctx, s.actionKey(obj.ActionID),
+		if err := s.GCSClient.Put(sctx, s.actionKey(obj.ActionID),
 			strings.NewReader(fmt.Sprintf("%s %d", obj.OutputID, fi.ModTime().UnixNano()))); err != nil {
 			gocache.Logf(ctx, "[gcs] write action %s: %v", obj.ActionID, err)
 			return err
